@@ -314,6 +314,117 @@ void uWS_App_get(F f, const FunctionCallbackInfo<Value> &args) {
         return;
     }
 
+    /* If the handler is String */
+    if (args[1]->IsArrayBuffer()) {
+        NativeString constantString(args.GetIsolate(), args[1]);
+        if (constantString.isInvalid(args)) {
+            return;
+        }
+
+        (app->*f)(std::string(pattern.getString()), [response = std::string(constantString.getString().data(), constantString.getString().length())](auto *res, auto *req) {
+            
+
+            if constexpr (!std::is_same<APP, uWS::H3App>::value) {
+
+                /* Parse the DeclarativeResponse */
+                std::string_view remainingInstructions(response.data(), response.length());
+                while (remainingInstructions.length()) {
+                    switch(remainingInstructions[0]) {
+                        case 0: {
+                            /* opCode END */
+                            uint16_t length;
+                            memcpy(&length, remainingInstructions.data() + 1, 2);
+                            remainingInstructions.remove_prefix(3); // Skip opCode and length bytes
+                            
+                            res->end(remainingInstructions.substr(0, length));
+                            remainingInstructions.remove_prefix(length);
+                        }
+                        break;
+                        case 1: {
+                            /* opCode WRITE_HEADER */
+                            uint8_t keyLength;
+                            memcpy(&keyLength, remainingInstructions.data() + 1, 1);
+                            remainingInstructions.remove_prefix(2); // Skip opCode and key length bytes
+                            
+                            std::string_view keyString(remainingInstructions.data(), keyLength);
+                            remainingInstructions.remove_prefix(keyLength);
+
+                            uint8_t valueLength;
+                            memcpy(&valueLength, remainingInstructions.data(), 1);
+                            remainingInstructions.remove_prefix(1); // Skip value length bytes
+                            
+                            std::string_view valueString(remainingInstructions.data(), valueLength);
+                            remainingInstructions.remove_prefix(valueLength);
+
+                            res->writeHeader(keyString, valueString);
+                        }
+                        break;
+                        case 2: {
+                            /* opCode WRITE_BODY */
+                            remainingInstructions.remove_prefix(1); // Skip opCode
+                            //res->writeBody();
+                        }
+                        break;
+                        case 3: {
+                            /* opCode WRITE_QUERY_VALUE */
+                            uint8_t keyLength;
+                            memcpy(&keyLength, remainingInstructions.data() + 1, 1);
+                            remainingInstructions.remove_prefix(2); // Skip opCode and key length bytes
+                            
+                            std::string_view keyString(remainingInstructions.data(), keyLength);
+                            remainingInstructions.remove_prefix(keyLength);
+
+                            res->write(req->getQuery(keyString));
+                        }
+                        break;
+                        case 4: {
+                            /* opCode WRITE_HEADER_VALUE */
+                            uint8_t keyLength;
+                            memcpy(&keyLength, remainingInstructions.data() + 1, 1);
+                            remainingInstructions.remove_prefix(2); // Skip opCode and key length bytes
+                            
+                            std::string_view keyString(remainingInstructions.data(), keyLength);
+                            remainingInstructions.remove_prefix(keyLength);
+
+                            res->write(req->getHeader(keyString));
+                        }
+                        break;
+                        case 5: {
+                            /* opCode WRITE */
+                            uint16_t length;
+                            memcpy(&length, remainingInstructions.data() + 1, 2);
+                            remainingInstructions.remove_prefix(3); // Skip opCode and length bytes
+                            
+                            std::string_view valueString(remainingInstructions.data(), length);
+                            remainingInstructions.remove_prefix(length);
+
+                            res->write(valueString);
+                        }
+                        break;
+                        case 6: {
+                            /* opCode WRITE_PARAMETER_VALUE */
+                            uint8_t keyLength;
+                            memcpy(&keyLength, remainingInstructions.data() + 1, 1);
+                            remainingInstructions.remove_prefix(2); // Skip opCode and key length bytes
+                            
+                            std::string_view keyString(remainingInstructions.data(), keyLength);
+                            remainingInstructions.remove_prefix(keyLength);
+
+                            res->write(req->getParameter(keyString));
+                        }
+                        break;
+                    }
+                }
+
+            }
+            
+
+        });
+
+        args.GetReturnValue().Set(args.Holder());
+        return;
+    }
+
     /* Handler */
     Callback checkedCallback(args.GetIsolate(), args[1]);
     if (checkedCallback.isInvalid(args)) {
@@ -603,6 +714,83 @@ std::pair<uWS::SocketContextOptions, bool> readOptionsObject(const FunctionCallb
 }
 
 template <typename APP>
+void uWS_App_adoptSocket(const FunctionCallbackInfo<Value> &args) {
+    APP *app = (APP *) args.Holder()->GetAlignedPointerFromInternalField(0);
+
+    Isolate *isolate = args.GetIsolate();
+
+    int32_t fd = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+
+    app->adoptSocket(fd);
+
+    args.GetReturnValue().Set(args.Holder());
+}
+
+template <typename APP>
+void uWS_App_removeChildApp(const FunctionCallbackInfo<Value> &args) {
+    APP *app = (APP *) args.Holder()->GetAlignedPointerFromInternalField(0);
+
+    Isolate *isolate = args.GetIsolate();
+
+    double descriptor = args[0]->NumberValue(isolate->GetCurrentContext()).ToChecked();
+
+    APP *receivingApp;
+    memcpy(&receivingApp, &descriptor, sizeof(receivingApp));
+
+    app->removeChildApp(receivingApp);
+
+    args.GetReturnValue().Set(args.Holder());
+}
+
+template <typename APP>
+void uWS_App_addChildApp(const FunctionCallbackInfo<Value> &args) {
+    APP *app = (APP *) args.Holder()->GetAlignedPointerFromInternalField(0);
+
+    Isolate *isolate = args.GetIsolate();
+
+    double descriptor = args[0]->NumberValue(isolate->GetCurrentContext()).ToChecked();
+
+
+    APP *receivingApp;// = (APP *) args[0]->ToObject(isolate->GetCurrentContext()).ToLocalChecked()->GetAlignedPointerFromInternalField(0);
+
+    memcpy(&receivingApp, &descriptor, sizeof(receivingApp));
+
+    /* Todo: check the class type of args[0] must match class type of args.Holder() */
+    //if (args[0])
+
+    //std::cout << "addChildApp: " << receivingApp << std::endl;
+
+    app->addChildApp(receivingApp);
+
+    args.GetReturnValue().Set(args.Holder());
+}
+
+template <typename APP>
+void uWS_App_getDescriptor(const FunctionCallbackInfo<Value> &args) {
+    APP *app = (APP *) args.Holder()->GetAlignedPointerFromInternalField(0);
+
+    Isolate *isolate = args.GetIsolate();
+
+    static_assert(sizeof(double) >= sizeof(app));
+
+    //static thread_local std::unordered_set<UniquePersistent<Object>> persistentApps;
+
+    UniquePersistent<Object> *persistentApp = new UniquePersistent<Object>;
+    persistentApp->Reset(args.GetIsolate(), args.Holder());
+
+    //persistentApps.emplace(persistentApp);
+
+    double descriptor = 0;
+    memcpy(&descriptor, &app, sizeof(app));
+
+    //std::cout << "getDescriptor: " << app << std::endl;
+
+    //std::cout << "Loop: " << app->getLoop() << std::endl;
+
+    args.GetReturnValue().Set(Number::New(isolate, descriptor));
+}
+
+template <typename APP>
 void uWS_App_addServerName(const FunctionCallbackInfo<Value> &args) {
     APP *app = (APP *) args.Holder()->GetAlignedPointerFromInternalField(0);
 
@@ -699,9 +887,69 @@ void uWS_App(const FunctionCallbackInfo<Value> &args) {
 
     appTemplate->InstanceTemplate()->SetInternalFieldCount(1);
 
+
     /* All the http methods */
     appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "get", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, [](auto &args) {
-        uWS_App_get<APP>(&APP::get, args);
+        
+        /* Add non-cached variants */
+        if constexpr (std::is_same<APP, uWS::App>::value) {
+
+            if (args.Length() == 3) {
+                /* Use cached variant */
+                std::cout << "Registering cached get handler" << std::endl;
+
+
+                APP *app = (APP *) args.Holder()->GetAlignedPointerFromInternalField(0);
+
+                /* Pattern */
+                NativeString pattern(args.GetIsolate(), args[0]);
+                if (pattern.isInvalid(args)) {
+                    return;
+                }
+
+                /* Handler */
+                Callback checkedCallback(args.GetIsolate(), args[1]);
+                if (checkedCallback.isInvalid(args)) {
+                    return;
+                }
+                UniquePersistent<Function> cb = checkedCallback.getFunction();
+
+                /* This function requires perContextData */
+                PerContextData *perContextData = (PerContextData *) Local<External>::Cast(args.Data())->Value();
+
+                app->get(std::string(pattern.getString()), [cb = std::move(cb), perContextData](auto *res, auto *req) {
+                    Isolate *isolate = perContextData->isolate;
+                    HandleScope hs(isolate);
+
+
+                    // this needs to be cachedresponse wrapper (for both cached tcp and cached SSL?)
+                    Local<Object> resObject = perContextData->resTemplate[/*getAppTypeIndex<APP>()*/3].Get(isolate)->Clone();
+                    resObject->SetAlignedPointerInInternalField(0, res);
+
+                    Local<Object> reqObject = perContextData->reqTemplate[std::is_same<APP, uWS::H3App>::value].Get(isolate)->Clone();
+                    reqObject->SetAlignedPointerInInternalField(0, req);
+
+                    Local<Value> argv[] = {resObject, reqObject};
+                    CallJS(isolate, cb.Get(isolate), 2, argv);
+
+                    /* Properly invalidate req */
+                    reqObject->SetAlignedPointerInInternalField(0, nullptr);
+
+                    /* µWS itself will terminate if not responded and not attached
+                    * onAborted handler, so we can assume it's done */
+                }, 13);
+
+                args.GetReturnValue().Set(args.Holder());
+
+
+            } else {
+                uWS_App_get<APP>(&uWS::TemplatedApp<false, uWS::CachingApp<false>>::get, args);
+            }
+
+        } else if constexpr (std::is_same<APP, uWS::SSLApp>::value) {
+            uWS_App_get<APP>(&uWS::TemplatedApp<true, uWS::CachingApp<true>>::get, args);
+        }
+       
     }, args.Data()));
 
     appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "post", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, [](auto &args) {
@@ -748,6 +996,12 @@ void uWS_App(const FunctionCallbackInfo<Value> &args) {
         appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "close", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, uWS_App_close<APP>, args.Data()));
         appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "listen_unix", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, uWS_App_listen_unix<APP>, args.Data()));
         appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "filter", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, uWS_App_filter<APP>, args.Data()));
+
+        /* load balancing */
+        appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "removeChildAppDescriptor", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, uWS_App_removeChildApp<APP>, args.Data()));
+        appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "addChildAppDescriptor", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, uWS_App_addChildApp<APP>, args.Data()));
+        appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "getDescriptor", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, uWS_App_getDescriptor<APP>, args.Data()));
+        appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "adoptSocket", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, uWS_App_adoptSocket<APP>, args.Data()));
 
         /* ws, listen */
         appTemplate->PrototypeTemplate()->Set(String::NewFromUtf8(isolate, "ws", NewStringType::kNormal).ToLocalChecked(), FunctionTemplate::New(isolate, uWS_App_ws<APP>, args.Data()));

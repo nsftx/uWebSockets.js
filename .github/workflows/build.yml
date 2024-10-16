@@ -24,15 +24,18 @@ jobs:
           git config --global user.name "Alex Hultman"
           git commit -a -m "[GitHub Actions] Updated windows-latest binaries"
           git push "https://unetworkingab:${{ secrets.SECRET }}@github.com/uNetworking/uWebSockets.js" binaries
+          git checkout master -- tests/smoke.js
+          npm install ws
+          node tests/smoke.js
   build-unix:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [macos-11.0, ubuntu-20.04]
+        os: [macos-12, ubuntu-20.04]
     steps:
       - name: Update binaries
         run: |
-          sudo xcode-select -switch /Applications/Xcode_12.2.app || true
+          uname -a
           sudo apt update || true
           sudo apt install -y g++-aarch64-linux-gnu || true
           git clone --recursive https://github.com/uNetworking/uWebSockets.js.git
@@ -41,6 +44,7 @@ jobs:
           git fetch origin binaries:binaries
           git checkout binaries
           cp dist/*.node .
+          cp dist/*.js .
           git status
           git rev-parse master > source_commit
           git checkout master docs/index.d.ts && mv docs/index.d.ts .
@@ -48,7 +52,9 @@ jobs:
           git config --global user.name "Alex Hultman"
           git commit -a -m "[GitHub Actions] Updated ${{ matrix.os }} binaries" || true
           git push "https://unetworkingab:${{ secrets.SECRET }}@github.com/uNetworking/uWebSockets.js" binaries
-
+          git checkout master -- tests/smoke.js
+          npm install ws
+          node tests/smoke.js
   build-arm:
     runs-on: ubuntu-latest
     name: Build on ${{ matrix.arch }}
