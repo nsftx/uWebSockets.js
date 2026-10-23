@@ -67,15 +67,52 @@ Local<v8::ArrayBuffer> ArrayBuffer_NewCopy(Isolate *isolate, void *data, size_t 
     return ab;
 }
 
+/* v8::Global's move constructor is not noexcept, so a lambda capturing one fails
+ * MoveOnlyFunction's small-object test and heap-allocates. The underlying move is
+ * a pointer swap and cannot throw, this wrapper only restores the noexcept */
+template <class T>
+struct NoexceptPersistent {
+    Global<T> p;
+
+    NoexceptPersistent() : p() {}
+    NoexceptPersistent(Isolate *isolate, const Local<T> &v) : p(isolate, v) {}
+    NoexceptPersistent(NoexceptPersistent &&other) noexcept : p(std::move(other.p)) {}
+
+    NoexceptPersistent& operator=(NoexceptPersistent &&other) noexcept {
+        if (this != &other) {
+            p = std::move(other.p);
+        }
+        return *this;
+    }
+
+    NoexceptPersistent(const NoexceptPersistent &) = delete;
+    NoexceptPersistent &operator=(const NoexceptPersistent &) = delete;
+
+    bool IsEmpty() const { return p.IsEmpty(); }
+    void Reset() { p.Reset(); }
+    void Reset(Isolate *isolate, const Local<T> &v) { p.Reset(isolate, v); }
+    Local<T> Get(Isolate *isolate) const { return p.Get(isolate); }
+
+    operator const Global<T>&() const { return p; }
+    operator Global<T>&() { return p; }
+
+    template <typename S>
+    bool operator==(const Local<S> &other) const { return p == other; }
+
+    template <typename S>
+    bool operator!=(const Local<S> &other) const { return p != other; }
+};
+static_assert(std::is_nothrow_move_constructible<NoexceptPersistent<Function>>::value, "NoexceptPersistent must be nothrow movable");
+
 struct PerSocketData {
-    UniquePersistent<Object> socketPf;
+    NoexceptPersistent<Object> socketPf;
 };
 
 struct PerContextData {
     Isolate *isolate;
-    UniquePersistent<Object> reqTemplate[2]; // 0 = non-SSL/SSL, 1 = Http3
-    UniquePersistent<Object> resTemplate[4]; // 0 = non-SSL, 1 = SSL, 2 = Http3
-    UniquePersistent<Object> wsTemplate[2];
+    NoexceptPersistent<Object> reqTemplate[2]; // 0 = non-SSL/SSL, 1 = Http3
+    NoexceptPersistent<Object> resTemplate[4]; // 0 = non-SSL, 1 = SSL, 2 = Http3
+    NoexceptPersistent<Object> wsTemplate[2];
 
     /* We hold all apps until free */
     std::vector<std::unique_ptr<uWS::App>> apps;
@@ -114,7 +151,7 @@ static inline bool missingArguments(int length, const FunctionCallbackInfo<Value
 
 struct Callback {
     bool invalid = false;
-    UniquePersistent<Function> f;
+    NoexceptPersistent<Function> f;
     Callback(Isolate *isolate, const Local<Value> &value) {
 
         if (!value->IsFunction()) {
@@ -132,7 +169,7 @@ struct Callback {
         return invalid;
     }
 
-    UniquePersistent<Function> &&getFunction() {
+    NoexceptPersistent<Function> &&getFunction() {
         return std::move(f);
     }
 };
@@ -141,82 +178,106 @@ template <bool AllowStringView = false>
 class NativeString {
     char *data;
     size_t length;
-    bool allocated = false;
     bool invalid = false;
 
-    // Static thread-local state shared by all NativeString instances on this thread
-    inline static thread_local std::vector<char> pool = std::vector<char>(128 * 1024);
-    inline static thread_local size_t pool_offset = 0;
-    inline static thread_local int ref_count = 0;
+    // State shared by all NativeString instances on this thread, in one thread-local read once per
+    // string: in an addon every thread-local access is a call into the dynamic linker
+    struct Pool {
+        std::vector<char> buffer = std::vector<char>(128 * 1024);
+        size_t offset = 0;
+        int refCount = 0;
+    };
+    inline static thread_local Pool threadPool;
+    // Only a string uses the pool, binary data never reads it. Null also tells the destructor there
+    // is nothing to free
+    Pool *pool = nullptr;
 
-    static char* alloc(size_t size) {
+    char* alloc(size_t size) {
         // Ensure size is a multiple of 8
         size = (size + 7) & ~7;
 
-        // Fallback for allocations larger than the remaining pool space
-        if (pool_offset + size > pool.size()) {
+        // Fallback for allocations larger than the remaining pool space, or that reach its end:
+        // on a full pool 0 bytes would get the end pointer, and free() would pass it to ::free
+        if (pool->offset + size >= pool->buffer.size()) {
             // Mark for external cleanup if using instance-based logic
             // (Note: In a pure static alloc, you'd need a way to track this)
             return (char*)std::malloc(size);
         }
 
-        char* ptr = pool.data() + pool_offset;
-        pool_offset += size;
+        char* ptr = pool->buffer.data() + pool->offset;
+        pool->offset += size;
         return ptr;
     }
 
     // Provided for completeness, though the "pool" doesn't actually free individual slices
-    static void free(char* ptr) {
-        if (ptr < pool.data() || ptr >= pool.data() + pool.size()) {
+    void free(char* ptr) {
+        if (ptr < pool->buffer.data() || ptr >= pool->buffer.data() + pool->buffer.size()) {
             ::free(ptr);
         }
     }
 
 public:
     NativeString(Isolate *isolate, const Local<Value> &value) {
-        if (ref_count == 0) {
-            pool_offset = 0; // Reset the "stack" when entering the first scope
-        }
-        ref_count++;
-
         if (value->IsUndefined()) {
             data = nullptr;
             length = 0;
         } else if (value->IsString()) {
+            pool = &threadPool;
+            if (pool->refCount == 0) {
+                pool->offset = 0; // Reset the "stack" when entering the first scope
+            }
+            pool->refCount++;
+
             Local<String> string = Local<String>::Cast(value);
 
-            /* StringView path is Latin-1, not Utf-8 */
-
+            /* One pass: write straight into what is left of the pool and keep the bytes written.
+             * When not all characters fit, measure the string and write it again.
+             * With more characters than free bytes it can never fit: skip the first write.
+             * A two-byte string is slow to write and takes up to 3 bytes per unit: past a third of
+             * the free pool it is measured first, so a write that does not fit is never thrown away */
+            size_t capacity = pool->buffer.size() - pool->offset;
+            bool fits = false;
+            /* Should really be string->IsOneByte() ? 2 : 3 but we kept Latin-1 as 1 byte UTF-8 for deliberate reasons */
+            if ((size_t) string->Length() * (string->IsOneByte() ? 1 : 3) <= capacity) {
             #if (V8_MAJOR_VERSION == 14)
-                // Fallback
-                length = string->Utf8LengthV2(isolate);
-                data = alloc(length);
-                allocated = true;
-                string->WriteUtf8V2(isolate, data, length);
+                size_t processed = 0;
+                length = string->WriteUtf8V2(isolate, pool->buffer.data() + pool->offset, capacity, String::WriteFlags::kNone, &processed);
+                fits = capacity && processed == (size_t) string->Length();
             #else
-                // Fallback
-                length = string->Utf8Length(isolate);
-                data = alloc(length);
-                allocated = true;
-                string->WriteUtf8(isolate, data, length, nullptr, String::WriteOptions::NO_NULL_TERMINATION);
+                int processed = 0;
+                length = string->WriteUtf8(isolate, pool->buffer.data() + pool->offset, (int) capacity, &processed, String::WriteOptions::NO_NULL_TERMINATION);
+                fits = capacity && processed == string->Length();
             #endif
+            }
+
+            if (fits) {
+                data = pool->buffer.data() + pool->offset;
+                pool->offset += (length + 7) & ~7;
+            } else {
+                #if (V8_MAJOR_VERSION == 14)
+                    length = string->Utf8LengthV2(isolate);
+                    data = alloc(length);
+                    string->WriteUtf8V2(isolate, data, length);
+                #else
+                    length = string->Utf8Length(isolate);
+                    data = alloc(length);
+                    string->WriteUtf8(isolate, data, length, nullptr, String::WriteOptions::NO_NULL_TERMINATION);
+                #endif
+            }
 
 
         } else if (value->IsArrayBufferView()) { /* DataView or TypedArray */
             Local<ArrayBufferView> arrayBufferView = Local<ArrayBufferView>::Cast(value);
-            auto contents = arrayBufferView->Buffer()->GetBackingStore();
             length = arrayBufferView->ByteLength();
-            data = (char *) contents->Data() + arrayBufferView->ByteOffset();
+            data = (char *) arrayBufferView->Buffer()->Data() + arrayBufferView->ByteOffset();
         } else if (value->IsArrayBuffer()) {
             Local<ArrayBuffer> arrayBuffer = Local<ArrayBuffer>::Cast(value);
-            auto contents = arrayBuffer->GetBackingStore();
-            length = contents->ByteLength();
-            data = (char *) contents->Data();
+            length = arrayBuffer->ByteLength();
+            data = (char *) arrayBuffer->Data();
         } else if (value->IsSharedArrayBuffer()) {
             Local<SharedArrayBuffer> arrayBuffer = Local<SharedArrayBuffer>::Cast(value);
-            auto contents = arrayBuffer->GetBackingStore();
-            length = contents->ByteLength();
-            data = (char *) contents->Data();
+            length = arrayBuffer->ByteLength();
+            data = (char *) arrayBuffer->Data();
         } else {
             invalid = true;
         }
@@ -234,8 +295,8 @@ public:
     }
 
     ~NativeString() {
-        ref_count--;
-        if (allocated) {
+        if (pool) {
+            pool->refCount--;
             free(data);
         }
     }

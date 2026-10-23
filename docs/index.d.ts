@@ -68,12 +68,15 @@ export interface WebSocket<UserData> {
     getBufferedAmount() : number;
 
     /** Gracefully closes this WebSocket. Immediately calls the close handler.
-     * A WebSocket close message is sent with code and shortMessage.
+     * A WebSocket close message is sent with code and shortMessage, and
+     * messages already passed to send() are delivered before the close.
      */
     end(code?: number, shortMessage?: RecognizedString) : void;
 
     /** Forcefully closes this WebSocket. Immediately calls the close handler.
-     * No WebSocket close message is sent.
+     * No WebSocket close message is sent. This maps to the close() syscall and
+     * inherits its effects, so messages already passed to send() are not
+     * delivered; use end() to send a last message before closing.
      */
     close() : void;
 
@@ -157,6 +160,8 @@ export interface HttpResponse {
     writeHeader(key: RecognizedString, value: RecognizedString) : HttpResponse;
     /** Enters or continues chunked encoding mode. Writes part of the response. End with zero length write. Returns true if no backpressure was added. */
     write(chunk: RecognizedString) : boolean;
+    /** Begins chunked encoding mode and flushes headers immediately. */
+    beginWrite() : HttpResponse;
     /** Ends this response by copying the contents of body. */
     end(body?: RecognizedString, closeConnection?: boolean) : HttpResponse;
     /** Ends this response without a body. */
